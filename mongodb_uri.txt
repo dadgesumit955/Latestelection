@@ -1,0 +1,1 @@
+mongodb://dadgesumit955_db_user:yz0CsHkihcbOgkt3@mtm-aws-aps1-3-m0-14-shard-00-00.w7gle.mongodb.net:27017,mtm-aws-aps1-3-m0-14-shard-00-01.w7gle.mongodb.net:27017,mtm-aws-aps1-3-m0-14-shard-00-02.w7gle.mongodb.net:27017/?authSource=admin&retryWrites=true&ssl=true&authMechanism=SCRAM-SHA-256
