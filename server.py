@@ -1,92 +1,35 @@
 import json
 import os
 import secrets
-import sqlite3
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
-'''BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "election.db")
-PORT = int(os.environ.get("PORT", "8000"))'''
+import pymongo
+from pymongo.errors import DuplicateKeyError
+
 MONGODB_URI = os.environ.get(
     "MONGODB_URI",
-    "mongodb+srv://krishu2415:6cl0D3k1tG4YdP7y@cluster0.9woa6.mongodb.net/"
+    "mongodb+srv://krishu2415:6cl0D3k1tG4YdP7y@cluster0.9woa6.mongodb.net/?retryWrites=true",
 )
 DB_NAME = "election_db"
 PORT = int(os.environ.get("PORT", "8000"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 if os.environ.get("RENDER"):
-    HOST = "0.0.0.0" 
+    HOST = "0.0.0.0"
 
 COLLEGE_NAME = "College of Engineering"
 DEPARTMENTS = ["AI & ML", "Computer Engineering", "Civil Engineering", "Electronics & Telecommunication"]
 ADMIN_USERS = {"admin": "admin123"}
 STATUSES = {"draft", "open", "paused", "closed", "published"}
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS students (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  department TEXT NOT NULL,
-  year TEXT DEFAULT 'SE',
-  pin TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS elections (
-  id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  type TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'draft',
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS election_departments (
-  election_id TEXT NOT NULL REFERENCES elections(id) ON DELETE CASCADE,
-  department TEXT NOT NULL,
-  PRIMARY KEY (election_id, department)
-);
-CREATE TABLE IF NOT EXISTS positions (
-  id TEXT PRIMARY KEY,
-  election_id TEXT NOT NULL REFERENCES elections(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  description TEXT
-);
-CREATE TABLE IF NOT EXISTS candidates (
-  id TEXT PRIMARY KEY,
-  position_id TEXT NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  department TEXT,
-  year TEXT,
-  platform TEXT,
-  symbol TEXT,
-  photo TEXT
-);
-CREATE TABLE IF NOT EXISTS voter_status (
-  election_id TEXT NOT NULL,
-  student_id TEXT NOT NULL,
-  receipt_no TEXT NOT NULL,
-  voted_at TEXT NOT NULL,
-  PRIMARY KEY (election_id, student_id)
-);
-CREATE TABLE IF NOT EXISTS ballots (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ballot_id TEXT NOT NULL,
-  election_id TEXT NOT NULL,
-  position_id TEXT NOT NULL,
-  candidate_id TEXT NOT NULL,
-  voted_at TEXT NOT NULL,
-  UNIQUE (ballot_id, election_id, position_id)
-);
-CREATE TABLE IF NOT EXISTS audit_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  at TEXT NOT NULL,
-  action TEXT NOT NULL
-);
-""" 
-
 tokens = {}
 uploads = {}
 write_lock = threading.Lock()
+
+client = None
+db = None
 
 
 def now():
@@ -101,46 +44,68 @@ def make_pin():
     return str(secrets.randbelow(900000) + 100000)
 
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def next_seq(key):
+    doc = db.seq.find_one_and_update(
+        {"_id": key},
+        {"$inc": {"n": 1}},
+        upsert=True,
+        return_document=pymongo.ReturnDocument.AFTER,
+    )
+    return doc["n"]
+
+
+# ---- collections -----------------------------------------------------------
+C_STUDENTS = "students"
+C_ELECTIONS = "elections"
+C_POSITIONS = "positions"
+C_CANDIDATES = "candidates"
+C_VOTER_STATUS = "voter_status"
+C_BALLOTS = "ballots"
+C_AUDIT = "audit_log"
+C_SEQ = "seq"
 
 
 def init_db():
-    conn = get_conn()
-    conn.executescript(SCHEMA)
-    conn.execute("PRAGMA journal_mode=WAL")
-    count = conn.execute("SELECT COUNT(*) AS c FROM elections").fetchone()["c"]
-    if count == 0:
-        seed(conn)
-        audit(conn, "System initialized with demo data")
-        conn.commit()
-    conn.close()
+    global client, db
+    client = pymongo.MongoClient(
+        MONGODB_URI,
+        serverSelectionTimeoutMS=20000,
+        retryWrites=True,
+    )
+    db = client[DB_NAME]
+
+    db[C_VOTER_STATUS].create_index(
+        [("election_id", 1), ("student_id", 1)], unique=True
+    )
+    db[C_BALLOTS].create_index(
+        [("ballot_id", 1), ("election_id", 1), ("position_id", 1)], unique=True
+    )
+    db[C_BALLOTS].create_index([("election_id", 1), ("position_id", 1)])
+    db[C_BALLOTS].create_index([("election_id", 1), ("position_id", 1), ("candidate_id", 1)])
+    db[C_POSITIONS].create_index([("election_id", 1), ("ord", 1)])
+    db[C_CANDIDATES].create_index([("position_id", 1), ("ord", 1)])
+
+    if db[C_ELECTIONS].count_documents({}) == 0:
+        seed()
+        audit("System initialized with demo data")
 
 
 def heal_demo_election():
-    conn = get_conn()
-    rows = conn.execute("SELECT id, title, status FROM elections").fetchall()
+    rows = list(db[C_ELECTIONS].find().sort("created_at", 1))
     if len(rows) == 1 and rows[0]["title"] == "General Secretary & College President Election 2026":
-        eid = rows[0]["id"]
-        ballots = conn.execute(
-            "SELECT COUNT(*) AS c FROM ballots WHERE election_id=?", (eid,)
-        ).fetchone()["c"]
-        if ballots == 0 and rows[0]["status"] != "open":
-            conn.execute("DELETE FROM voter_status WHERE election_id=?", (eid,))
-            conn.execute("UPDATE elections SET status='open' WHERE id=?", (eid,))
-            conn.commit()
+        eid = rows[0]["_id"]
+        ballots = db[C_BALLOTS].distinct("ballot_id", {"election_id": eid})
+        if not ballots and rows[0]["status"] != "open":
+            db[C_VOTER_STATUS].delete_many({"election_id": eid})
+            db[C_ELECTIONS].update_one({"_id": eid}, {"$set": {"status": "open"}})
             print("  [self-heal] Demo election reopened for voting (no ballots were cast).")
-    conn.close()
 
 
-def audit(conn, action):
-    conn.execute("INSERT INTO audit_log (at, action) VALUES (?, ?)", (now(), action))
+def audit(action):
+    db[C_AUDIT].insert_one({"id": next_seq("audit"), "at": now(), "action": action})
 
 
-def seed(conn):
+def seed():
     students = [
         ("AIML_01", "Suraj Jadhav", "AI & ML", "SE", "482913"),
         ("AIML_62", "Aditya Pawar", "AI & ML", "SE", "773102"),
@@ -151,19 +116,22 @@ def seed(conn):
         ("CIVIL_09", "Varun Deshmukh", "Civil Engineering", "BE", "118276"),
         ("ETC_15", "Kavya Nair", "Electronics & Telecommunication", "TE", "905614"),
     ]
-    conn.executemany(
-        "INSERT OR IGNORE INTO students (id, name, department, year, pin) VALUES (?, ?, ?, ?, ?)", students
-    )
+    for sid, name, dept, year, pin in students:
+        db[C_STUDENTS].update_one(
+            {"_id": sid},
+            {"$setOnInsert": {"_id": sid, "name": name, "department": dept, "year": year, "pin": pin}},
+            upsert=True,
+        )
 
     eid = make_id("e_")
-    conn.execute(
-        "INSERT INTO elections (id, title, type, status, created_at) VALUES (?, ?, ?, ?, ?)",
-        (eid, "General Secretary & College President Election 2026", "college-wide", "open", now()),
-    )
-    for d in DEPARTMENTS:
-        conn.execute(
-            "INSERT INTO election_departments (election_id, department) VALUES (?, ?)", (eid, d)
-        )
+    db[C_ELECTIONS].insert_one({
+        "_id": eid,
+        "title": "General Secretary & College President Election 2026",
+        "type": "college-wide",
+        "status": "open",
+        "created_at": now(),
+        "departments": DEPARTMENTS,
+    })
 
     positions = [
         ("General Secretary", "Manages council coordination, communications and documentation across all departments.", [
@@ -181,92 +149,77 @@ def seed(conn):
             ("Aditya Pawar", "AI & ML", "SE", "Cultural fest, arts funding, student creative spaces", "🎭"),
         ]),
     ]
-    for title, desc, cands in positions:
+    for ord_i, (title, desc, cands) in enumerate(positions):
         pid = make_id("p_")
-        conn.execute(
-            "INSERT INTO positions (id, election_id, title, description) VALUES (?, ?, ?, ?)",
-            (pid, eid, title, desc),
-        )
-        for name, dept, year, platform, symbol in cands:
-            conn.execute(
-                "INSERT INTO candidates (id, position_id, name, department, year, platform, symbol, photo) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (make_id("c_"), pid, name, dept, year, platform, symbol, None),
-            )
+        db[C_POSITIONS].insert_one({"_id": pid, "election_id": eid, "title": title, "description": desc, "ord": ord_i})
+        for ord_j, (name, dept, year, platform, symbol) in enumerate(cands):
+            db[C_CANDIDATES].insert_one({
+                "_id": make_id("c_"), "position_id": pid, "name": name,
+                "department": dept, "year": year, "platform": platform,
+                "symbol": symbol, "photo": None, "ord": ord_j,
+            })
 
 
-def student_eligible(conn, student, election_id, etype, depts):
-    if etype == "college-wide":
+def student_eligible(student, election):
+    if election.get("type") == "college-wide":
         return True
-    row = conn.execute(
-        "SELECT 1 FROM election_departments WHERE election_id=? AND department=?",
-        (election_id, student["department"]),
-    ).fetchone()
-    return row is not None
+    depts = election.get("departments") or []
+    if not depts:
+        return True
+    return student["department"] in depts
+
+
+def compute_eligible_count(election):
+    if election.get("type") == "college-wide":
+        return db[C_STUDENTS].count_documents({})
+    depts = election.get("departments") or []
+    if not depts:
+        return db[C_STUDENTS].count_documents({})
+    return db[C_STUDENTS].count_documents({"department": {"$in": depts}})
 
 
 def compute_results(election_id):
-    conn = get_conn()
-    election = conn.execute("SELECT * FROM elections WHERE id=?", (election_id,)).fetchone()
+    election = db[C_ELECTIONS].find_one({"_id": election_id})
     if not election:
-        conn.close()
         return None
-    positions = conn.execute(
-        "SELECT * FROM positions WHERE election_id=? ORDER BY rowid", (election_id,)
-    ).fetchall()
-    total_students = conn.execute("SELECT COUNT(*) AS c FROM students").fetchone()["c"]
-    eligible = total_students
-    if election["type"] != "college-wide":
-        depts = [
-            r["department"]
-            for r in conn.execute(
-                "SELECT department FROM election_departments WHERE election_id=?", (election_id,)
-            )
-        ]
-        if depts:
-            eligible = conn.execute(
-                "SELECT COUNT(*) AS c FROM students WHERE department IN (%s)"
-                % ",".join("?" * len(depts)),
-                depts,
-            ).fetchone()["c"]
-    votes = conn.execute(
-        "SELECT COUNT(DISTINCT ballot_id) AS c FROM ballots WHERE election_id=?", (election_id,)
-    ).fetchone()["c"]
+    positions = list(db[C_POSITIONS].find({"election_id": election_id}).sort("ord", 1))
+    eligible = compute_eligible_count(election)
+    votes = len(db[C_BALLOTS].distinct("ballot_id", {"election_id": election_id}))
     turnout = round((votes / eligible) * 100) if eligible > 0 else 0
 
     out_positions = []
     for p in positions:
-        cand_rows = conn.execute(
-            "SELECT * FROM candidates WHERE position_id=? ORDER BY rowid", (p["id"],)
-        ).fetchall()
+        cand_rows = list(db[C_CANDIDATES].find({"position_id": p["_id"]}).sort("ord", 1))
+        cand_ids = [c["_id"] for c in cand_rows]
         tally = {}
         for c in cand_rows:
-            tally[c["id"]] = conn.execute(
-                "SELECT COUNT(*) AS c FROM ballots WHERE election_id=? AND position_id=? AND candidate_id=?",
-                (election_id, p["id"], c["id"]),
-            ).fetchone()["c"]
-        tally["NOTA"] = conn.execute(
-            "SELECT COUNT(*) AS c FROM ballots WHERE election_id=? AND position_id=? AND candidate_id='NOTA'",
-            (election_id, p["id"]),
-        ).fetchone()["c"]
-        cand_ids = [c["id"] for c in cand_rows]
-        matter = "candidate_id NOT IN (%s)" % ",".join("?" * len(cand_ids)) if cand_ids else "candidate_id <> 'NOTA'"
-        orphan = conn.execute(
-            "SELECT COUNT(*) AS c FROM ballots WHERE election_id=? AND position_id=? AND %s"
-            % matter,
-            (election_id, p["id"], *cand_ids) if cand_ids else (election_id, p["id"]),
-        ).fetchone()["c"]
+            tally[c["_id"]] = db[C_BALLOTS].count_documents(
+                {"election_id": election_id, "position_id": p["_id"], "candidate_id": c["_id"]}
+            )
+        tally["NOTA"] = db[C_BALLOTS].count_documents(
+            {"election_id": election_id, "position_id": p["_id"], "candidate_id": "NOTA"}
+        )
+        if cand_ids:
+            orphan = db[C_BALLOTS].count_documents(
+                {"election_id": election_id, "position_id": p["_id"],
+                 "candidate_id": {"$nin": cand_ids + ["NOTA"]}}
+            )
+        else:
+            orphan = db[C_BALLOTS].count_documents(
+                {"election_id": election_id, "position_id": p["_id"], "candidate_id": {"$ne": "NOTA"}}
+            )
         tally_vals = list(tally.values()) + [orphan]
         position_total = sum(tally_vals)
         max_votes = max(tally_vals) if tally_vals else 0
         rows = []
         for c in cand_rows:
-            v = tally[c["id"]]
+            v = tally[c["_id"]]
             rows.append({
-                "id": c["id"],
+                "id": c["_id"],
                 "name": c["name"],
-                "department": c["department"],
-                "photo": c["photo"],
-                "symbol": c["symbol"],
+                "department": c.get("department"),
+                "photo": c.get("photo"),
+                "symbol": c.get("symbol"),
                 "votes": v,
                 "pct": round((v / position_total) * 100) if position_total > 0 else 0,
                 "winner": v == max_votes and v > 0,
@@ -294,16 +247,16 @@ def compute_results(election_id):
                 "winner": False,
             })
         out_positions.append({
-            "id": p["id"],
+            "id": p["_id"],
             "title": p["title"],
-            "description": p["description"],
+            "description": p.get("description"),
             "total": position_total,
             "rows": rows,
         })
-    conn.close()
+
     return {
         "election": {
-            "id": election["id"],
+            "id": election["_id"],
             "title": election["title"],
             "status": election["status"],
             "type": election["type"],
@@ -313,62 +266,33 @@ def compute_results(election_id):
     }
 
 
-def build_election_detail(conn, election):
-    depts = [
-        r["department"]
-        for r in conn.execute(
-            "SELECT department FROM election_departments WHERE election_id=? ORDER BY rowid",
-            (election["id"],),
-        )
-    ]
+def build_election_detail(election):
     positions = []
-    for p in conn.execute(
-        "SELECT * FROM positions WHERE election_id=? ORDER BY rowid", (election["id"],)
-    ):
-        candidates = [
-            dict(c)
-            for c in conn.execute(
-                "SELECT * FROM candidates WHERE position_id=? ORDER BY rowid", (p["id"],)
-            )
-        ]
+    for p in db[C_POSITIONS].find({"election_id": election["_id"]}).sort("ord", 1):
+        candidates = list(db[C_CANDIDATES].find({"position_id": p["_id"]}).sort("ord", 1))
         positions.append({
-            "id": p["id"],
+            "id": p["_id"],
             "title": p["title"],
-            "description": p["description"],
-            "candidates": candidates,
+            "description": p.get("description"),
+            "candidates": [
+                {"id": c["_id"], "name": c["name"], "department": c.get("department"),
+                 "year": c.get("year"), "platform": c.get("platform"), "symbol": c.get("symbol"),
+                 "photo": c.get("photo")}
+                for c in candidates
+            ],
         })
-    ballots = conn.execute(
-        "SELECT COUNT(DISTINCT ballot_id) AS c FROM ballots WHERE election_id=?", (election["id"],)
-    ).fetchone()["c"]
-    eligible = compute_eligible_count(conn, election)
+    ballots = len(db[C_BALLOTS].distinct("ballot_id", {"election_id": election["_id"]}))
     return {
-        "id": election["id"],
+        "id": election["_id"],
         "title": election["title"],
         "type": election["type"],
         "status": election["status"],
         "created_at": election["created_at"],
-        "departments": depts,
+        "departments": election.get("departments") or [],
         "positions": positions,
         "ballots": ballots,
-        "eligible_count": eligible,
+        "eligible_count": compute_eligible_count(election),
     }
-
-
-def compute_eligible_count(conn, election):
-    if election["type"] == "college-wide":
-        return conn.execute("SELECT COUNT(*) AS c FROM students").fetchone()["c"]
-    depts = [
-        r["department"]
-        for r in conn.execute(
-            "SELECT department FROM election_departments WHERE election_id=?", (election["id"],)
-        )
-    ]
-    if not depts:
-        return conn.execute("SELECT COUNT(*) AS c FROM students").fetchone()["c"]
-    return conn.execute(
-        "SELECT COUNT(*) AS c FROM students WHERE department IN (%s)" % ",".join("?" * len(depts)),
-        depts,
-    ).fetchone()["c"]
 
 
 def validate_election_payload(data):
@@ -388,74 +312,51 @@ def validate_election_payload(data):
     return None
 
 
-def replace_election_payload(conn, election_id, data):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM election_departments WHERE election_id=?", (election_id,))
-    for d in data.get("departments", []):
-        cur.execute(
-            "INSERT INTO election_departments (election_id, department) VALUES (?, ?)",
-            (election_id, d),
-        )
-    existing_pos_ids = {
-        r["id"]
-        for r in cur.execute(
-            "SELECT id FROM positions WHERE election_id=?", (election_id,)
-        ).fetchall()
-    }
-    new_pos_ids = set()
-    for p in data.get("positions", []):
+def replace_election_payload(eid, data):
+    db[C_ELECTIONS].update_one({"_id": eid}, {"$set": {"departments": data.get("departments") or []}})
+    existing_pos = {p["_id"]: p for p in db[C_POSITIONS].find({"election_id": eid})}
+    new_pos_ids = []
+    for ord_i, p in enumerate(data.get("positions", [])):
         pid = p.get("id")
-        is_existing_pos = pid and pid in existing_pos_ids
-        if is_existing_pos:
-            cur.execute(
-                "UPDATE positions SET title=?, description=? WHERE id=?",
-                (p["title"], p.get("description", ""), pid),
+        if pid and pid in existing_pos:
+            db[C_POSITIONS].update_one(
+                {"_id": pid},
+                {"$set": {"title": p["title"], "description": p.get("description", ""), "ord": ord_i}},
             )
         else:
             pid = make_id("p_")
-            cur.execute(
-                "INSERT INTO positions (id, election_id, title, description) VALUES (?, ?, ?, ?)",
-                (pid, election_id, p["title"], p.get("description", "")),
-            )
-        new_pos_ids.add(pid)
-        existing_cand_ids = {
-            r["id"]
-            for r in cur.execute(
-                "SELECT id FROM candidates WHERE position_id=?", (pid,)
-            ).fetchall()
-        }
-        new_cand_ids = set()
-        for c in p.get("candidates", []):
+            db[C_POSITIONS].insert_one({
+                "_id": pid, "election_id": eid, "title": p["title"],
+                "description": p.get("description", ""), "ord": ord_i,
+            })
+        new_pos_ids.append(pid)
+        existing_cand = {c["_id"]: c for c in db[C_CANDIDATES].find({"position_id": pid})}
+        new_cand_ids = []
+        for ord_j, c in enumerate(p.get("candidates", [])):
             if not c.get("name") or not str(c["name"]).strip():
                 continue
             cid = c.get("id")
-            is_existing_cand = cid and cid in existing_cand_ids
-            payload = (c["name"], c.get("department", ""), c.get("year", ""), c.get("platform", ""), c.get("symbol", ""), c.get("photo"))
-            if is_existing_cand:
-                cur.execute(
-                    "UPDATE candidates SET name=?, department=?, year=?, platform=?, symbol=?, photo=? WHERE id=?",
-                    (*payload, cid),
-                )
-                new_cand_ids.add(cid)
+            payload = {
+                "name": c["name"], "department": c.get("department", ""), "year": c.get("year", ""),
+                "platform": c.get("platform", ""), "symbol": c.get("symbol", ""), "photo": c.get("photo"),
+                "ord": ord_j,
+            }
+            if cid and cid in existing_cand:
+                db[C_CANDIDATES].update_one({"_id": cid}, {"$set": payload})
+                new_cand_ids.append(cid)
             else:
                 cid = make_id("c_")
-                cur.execute(
-                    "INSERT INTO candidates (id, position_id, name, department, year, platform, symbol, photo) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (cid, pid, *payload),
-                )
-                new_cand_ids.add(cid)
-        removed = existing_cand_ids - new_cand_ids
-        if removed:
-            if new_cand_ids:
-                q = ",".join("?" * len(new_cand_ids))
-                cur.execute(
-                    "DELETE FROM candidates WHERE position_id=? AND id NOT IN (%s)" % q,
-                    [pid] + list(new_cand_ids),
-                )
-            else:
-                cur.execute("DELETE FROM candidates WHERE position_id=?", (pid,))
-    for oid in existing_pos_ids - new_pos_ids:
-        cur.execute("DELETE FROM positions WHERE id=?", (oid,))
+                payload["_id"] = cid
+                payload["position_id"] = pid
+                db[C_CANDIDATES].insert_one(payload)
+                new_cand_ids.append(cid)
+        if new_cand_ids:
+            db[C_CANDIDATES].delete_many({"position_id": pid, "_id": {"$nin": new_cand_ids}})
+        else:
+            db[C_CANDIDATES].delete_many({"position_id": pid})
+    for oid in set(existing_pos.keys()) - set(new_pos_ids):
+        db[C_CANDIDATES].delete_many({"position_id": oid})
+        db[C_POSITIONS].delete_one({"_id": oid})
 
 
 def make_token(role, student_id=None):
@@ -531,7 +432,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors()
-        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
@@ -559,28 +459,24 @@ class Handler(BaseHTTPRequestHandler):
             if not info:
                 self._json(401, {"ok": False, "error": "Not authorized"})
                 return
-            conn = get_conn()
-            student = conn.execute("SELECT * FROM students WHERE id=?", (info["student_id"],)).fetchone()
+            student = db[C_STUDENTS].find_one({"_id": info["student_id"]})
             if not student:
-                conn.close()
                 self._json(401, {"ok": False, "error": "Student not found"})
                 return
-            elections = conn.execute("SELECT * FROM elections ORDER BY rowid").fetchall()
             available, others = [], []
-            for e in elections:
-                voted = conn.execute(
-                    "SELECT 1 FROM voter_status WHERE election_id=? AND student_id=?", (e["id"], student["id"])
-                ).fetchone() is not None
-                detail = build_election_detail(conn, e)
-                eligible = student_eligible(conn, dict(student), e["id"], e["type"], None)
+            for e in db[C_ELECTIONS].find().sort([("created_at", 1), ("_id", 1)]):
+                voted = db[C_VOTER_STATUS].find_one(
+                    {"election_id": e["_id"], "student_id": student["_id"]}
+                ) is not None
+                detail = build_election_detail(e)
+                eligible = student_eligible(student, e)
                 if e["status"] == "open" and eligible and not voted:
                     available.append({**detail, "voted": voted})
                 else:
                     others.append({
-                        "id": e["id"], "title": e["title"], "type": e["type"],
+                        "id": e["_id"], "title": e["title"], "type": e["type"],
                         "status": e["status"], "voted": voted, "eligible": eligible,
                     })
-            conn.close()
             self._json(200, {"ok": True, "available": available, "others": others})
             return
 
@@ -588,62 +484,52 @@ class Handler(BaseHTTPRequestHandler):
             if not authorize(self, "admin"):
                 self._json(401, {"ok": False, "error": "Not authorized"})
                 return
-            conn = get_conn()
             if parts[2] == "elections" and len(parts) == 3:
-                rows = conn.execute("SELECT * FROM elections ORDER BY rowid").fetchall()
                 out = []
-                for e in rows:
-                    detail = build_election_detail(conn, e)
+                for e in db[C_ELECTIONS].find().sort([("created_at", 1), ("_id", 1)]):
+                    detail = build_election_detail(e)
                     out.append({
-                        "id": e["id"], "title": e["title"], "type": e["type"],
+                        "id": e["_id"], "title": e["title"], "type": e["type"],
                         "status": e["status"], "created_at": e["created_at"],
                         "positions_count": len(detail["positions"]),
                         "ballots": detail["ballots"],
                         "eligible_count": detail["eligible_count"],
                     })
-                conn.close()
                 self._json(200, {"ok": True, "elections": out})
                 return
             if parts[2] == "elections" and len(parts) == 4:
-                row = conn.execute("SELECT * FROM elections WHERE id=?", (parts[3],)).fetchone()
-                if not row:
-                    conn.close()
+                e = db[C_ELECTIONS].find_one({"_id": parts[3]})
+                if not e:
                     self._json(404, {"ok": False, "error": "Election not found"})
                     return
-                detail = build_election_detail(conn, row)
-                conn.close()
-                self._json(200, {"ok": True, **detail})
+                self._json(200, {"ok": True, **build_election_detail(e)})
                 return
             if parts[2] == "students" and len(parts) == 3:
                 rows = [
-                    dict(r)
-                    for r in conn.execute("SELECT * FROM students ORDER BY id").fetchall()
+                    {"id": s["_id"], "name": s["name"], "department": s["department"],
+                     "year": s["year"], "pin": s["pin"]}
+                    for s in db[C_STUDENTS].find().sort("_id", 1)
                 ]
-                conn.close()
                 self._json(200, {"ok": True, "students": rows})
                 return
             if parts[2] == "audit" and len(parts) == 3:
-                rows = [
-                    dict(r)
-                    for r in conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 300").fetchall()
+                log = [
+                    {"id": a["id"], "at": a["at"], "action": a["action"]}
+                    for a in db[C_AUDIT].find().sort("id", -1).limit(300)
                 ]
-                conn.close()
-                self._json(200, {"ok": True, "log": rows})
+                self._json(200, {"ok": True, "log": log})
                 return
             if parts[2] == "export" and len(parts) == 4:
                 res = compute_results(parts[3])
                 if not res:
-                    conn.close()
                     self._json(404, {"ok": False, "error": "Election not found"})
                     return
-                conn.close()
                 csv = "Position,Candidate,Votes,Percentage\n"
                 for pos in res["positions"]:
                     for row in pos["rows"]:
                         csv += f'{pos["title"]},{row["name"]},{row["votes"]},{row["pct"]}%\n'
                 self._text(200, csv, "text/csv; charset=utf-8")
                 return
-            conn.close()
             self._json(404, {"ok": False, "error": "Unknown endpoint"})
             return
 
@@ -658,14 +544,12 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["api", "login"]:
             sid = str(data.get("student_id", "")).strip()
             pin = str(data.get("pin", "")).strip()
-            conn = get_conn()
-            student = conn.execute("SELECT * FROM students WHERE id=?", (sid,)).fetchone()
-            conn.close()
+            student = db[C_STUDENTS].find_one({"_id": sid})
             if not student or student["pin"] != pin or (not sid and not pin):
                 self._json(401, {"ok": False, "error": "Invalid Student ID or PIN"})
                 return
-            tok = make_token("student", student["id"])
-            self._json(200, {"ok": True, "token": tok, "student": {"id": student["id"], "name": student["name"], "department": student["department"], "year": student["year"]}})
+            tok = make_token("student", student["_id"])
+            self._json(200, {"ok": True, "token": tok, "student": {"id": student["_id"], "name": student["name"], "department": student["department"], "year": student["year"]}})
             return
 
         if parts == ["api", "admin", "login"]:
@@ -675,10 +559,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"ok": False, "error": "Invalid admin credentials"})
                 return
             tok = make_token("admin")
-            conn = get_conn()
-            audit(conn, f'Admin "{u}" logged in')
-            conn.commit()
-            conn.close()
+            audit(f'Admin "{u}" logged in')
             self._json(200, {"ok": True, "token": tok})
             return
 
@@ -690,80 +571,57 @@ class Handler(BaseHTTPRequestHandler):
             election_id = str(data.get("election_id", ""))
             selections = data.get("selections") or {}
             with write_lock:
-                conn = sqlite3.connect(DB_PATH)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA foreign_keys = ON")
-                conn.isolation_level = None
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    cur = conn.cursor()
-                    election = cur.execute("SELECT * FROM elections WHERE id=?", (election_id,)).fetchone()
-                    if not election:
-                        conn.execute("ROLLBACK")
-                        self._json(404, {"ok": False, "error": "Election not found"})
+                election = db[C_ELECTIONS].find_one({"_id": election_id})
+                if not election:
+                    self._json(404, {"ok": False, "error": "Election not found"})
+                    return
+                if election["status"] != "open":
+                    self._json(409, {"ok": False, "error": "Voting is not open"})
+                    return
+                student = db[C_STUDENTS].find_one({"_id": info["student_id"]})
+                if not student:
+                    self._json(401, {"ok": False, "error": "Student not found"})
+                    return
+                if election["type"] != "college-wide":
+                    depts = election.get("departments") or []
+                    if depts and student["department"] not in depts:
+                        self._json(403, {"ok": False, "error": "You are not eligible for this election"})
                         return
-                    if election["status"] != "open":
-                        conn.execute("ROLLBACK")
-                        self._json(409, {"ok": False, "error": "Voting is not open"})
-                        return
-                    student = cur.execute("SELECT * FROM students WHERE id=?", (info["student_id"],)).fetchone()
-                    if not student:
-                        conn.execute("ROLLBACK")
-                        self._json(401, {"ok": False, "error": "Student not found"})
-                        return
-                    if election["type"] != "college-wide":
-                        dept_rows = cur.execute(
-                            "SELECT department FROM election_departments WHERE election_id=?",
-                            (election_id,),
-                        ).fetchall()
-                        if dept_rows and student["department"] not in {r["department"] for r in dept_rows}:
-                            conn.execute("ROLLBACK")
-                            self._json(403, {"ok": False, "error": "You are not eligible for this election"})
+                positions = list(db[C_POSITIONS].find({"election_id": election_id}))
+                pos_ids = {p["_id"] for p in positions}
+                if set(selections.keys()) != pos_ids:
+                    self._json(400, {"ok": False, "error": "Every position must have exactly one selection"})
+                    return
+                for pid, cid in selections.items():
+                    if cid != "NOTA":
+                        okc = db[C_CANDIDATES].find_one({"_id": cid, "position_id": pid})
+                        if not okc:
+                            self._json(400, {"ok": False, "error": "Invalid candidate selection"})
                             return
-                    positions = cur.execute(
-                        "SELECT id FROM positions WHERE election_id=?", (election_id,)
-                    ).fetchall()
-                    pos_ids = {r["id"] for r in positions}
-                    if set(selections.keys()) != pos_ids:
-                        conn.execute("ROLLBACK")
-                        self._json(400, {"ok": False, "error": "Every position must have exactly one selection"})
-                        return
-                    for pid, cid in selections.items():
-                        if cid != "NOTA":
-                            okc = cur.execute(
-                                "SELECT 1 FROM candidates WHERE id=? AND position_id=?", (cid, pid)
-                            ).fetchone()
-                            if not okc:
-                                conn.execute("ROLLBACK")
-                                self._json(400, {"ok": False, "error": "Invalid candidate selection"})
-                                return
-                    receipt = "SAE-" + secrets.token_hex(4).upper()
-                    ts = now()
-                    try:
-                        cur.execute(
-                            "INSERT INTO voter_status (election_id, student_id, receipt_no, voted_at) VALUES (?, ?, ?, ?)",
-                            (election_id, info["student_id"], receipt, ts),
-                        )
-                    except sqlite3.IntegrityError:
-                        conn.execute("ROLLBACK")
-                        self._json(409, {"ok": False, "error": "This student has already voted in this election"})
-                        return
-                    ballot_id = "b" + secrets.token_hex(5)
-                    for pid, cid in selections.items():
-                        cur.execute(
-                            "INSERT INTO ballots (ballot_id, election_id, position_id, candidate_id, voted_at) VALUES (?, ?, ?, ?, ?)",
-                            (ballot_id, election_id, pid, cid, ts),
-                        )
-                    conn.execute("COMMIT")
-                    self._json(200, {"ok": True, "receipt": receipt})
-                except Exception as ex:
-                    try:
-                        conn.execute("ROLLBACK")
-                    except Exception:
-                        pass
-                    self._json(500, {"ok": False, "error": "Server error: " + str(ex)})
-                finally:
-                    conn.close()
+                receipt = "SAE-" + secrets.token_hex(4).upper()
+                ts = now()
+                try:
+                    db[C_VOTER_STATUS].insert_one({
+                        "election_id": election_id, "student_id": info["student_id"],
+                        "receipt_no": receipt, "voted_at": ts,
+                    })
+                except DuplicateKeyError:
+                    self._json(409, {"ok": False, "error": "This student has already voted in this election"})
+                    return
+                ballot_id = "b" + secrets.token_hex(5)
+                docs = [
+                    {"ballot_id": ballot_id, "election_id": election_id, "position_id": pid,
+                     "candidate_id": cid, "voted_at": ts}
+                    for pid, cid in selections.items()
+                ]
+                try:
+                    db[C_BALLOTS].insert_many(docs)
+                except Exception:
+                    db[C_BALLOTS].delete_many({"ballot_id": ballot_id, "election_id": election_id})
+                    db[C_VOTER_STATUS].delete_one({"election_id": election_id, "student_id": info["student_id"]})
+                    self._json(500, {"ok": False, "error": "Server error storing ballot"})
+                    return
+                self._json(200, {"ok": True, "receipt": receipt})
             return
 
         if parts[:3] == ["api", "admin", "elections"] and len(parts) == 3 and path.count("/") == 3:
@@ -775,25 +633,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": validator})
                 return
             with write_lock:
-                conn = get_conn()
-                try:
-                    eid = make_id("e_")
-                    conn.execute(
-                        "INSERT INTO elections (id, title, type, status, created_at) VALUES (?, ?, ?, ?, ?)",
-                        (eid, data["title"].strip(), data["type"], "draft", now()),
-                    )
-                    replace_election_payload(conn, eid, data)
-                    audit(conn, f'Created election "{data["title"].strip()}"')
-                    conn.commit()
-                except Exception as ex:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    self._json(500, {"ok": False, "error": str(ex)})
-                    return
-                finally:
-                    conn.close()
+                eid = make_id("e_")
+                db[C_ELECTIONS].insert_one({
+                    "_id": eid, "title": data["title"].strip(), "type": data["type"],
+                    "status": "draft", "created_at": now(), "departments": data.get("departments") or [],
+                })
+                replace_election_payload(eid, data)
+                audit(f'Created election "{data["title"].strip()}"')
             self._json(200, {"ok": True, "id": eid})
             return
 
@@ -806,24 +652,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "Invalid status"})
                 return
             with write_lock:
-                conn = get_conn()
-                try:
-                    row = conn.execute("SELECT * FROM elections WHERE id=?", (parts[3],)).fetchone()
-                    if not row:
-                        self._json(404, {"ok": False, "error": "Election not found"})
-                        return
-                    conn.execute("UPDATE elections SET status=? WHERE id=?", (status, parts[3]))
-                    audit(conn, f'Set election "{row["title"]}" status to {status}')
-                    conn.commit()
-                except Exception as ex:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    self._json(500, {"ok": False, "error": str(ex)})
+                row = db[C_ELECTIONS].find_one({"_id": parts[3]})
+                if not row:
+                    self._json(404, {"ok": False, "error": "Election not found"})
                     return
-                finally:
-                    conn.close()
+                db[C_ELECTIONS].update_one({"_id": parts[3]}, {"$set": {"status": status}})
+                audit(f'Set election "{row["title"]}" status to {status}')
             self._json(200, {"ok": True})
             return
 
@@ -847,13 +681,7 @@ class Handler(BaseHTTPRequestHandler):
                         duplicates.append(sid)
                         continue
                     seen.add(sid)
-                    with write_lock:
-                        conn = get_conn()
-                        try:
-                            dup = conn.execute("SELECT 1 FROM students WHERE id=?", (sid,)).fetchone()
-                        finally:
-                            conn.close()
-                    if dup:
+                    if db[C_STUDENTS].find_one({"_id": sid}):
                         duplicates.append(sid)
                         continue
                     valid.append({"id": sid, "name": name, "department": dept, "year": year, "pin": make_pin()})
@@ -867,30 +695,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": "Upload session expired. Please try again."})
                 return
             with write_lock:
-                conn = get_conn()
-                try:
-                    cur = conn.cursor()
-                    inserted = 0
-                    for r in staged["records"]:
-                        try:
-                            cur.execute(
-                                "INSERT INTO students (id, name, department, year, pin) VALUES (?, ?, ?, ?, ?)",
-                                (r["id"], r["name"], r["department"], r["year"], r["pin"]),
-                            )
-                            inserted += 1
-                        except sqlite3.IntegrityError:
-                            pass
-                    audit(conn, f"Imported {inserted} students")
-                    conn.commit()
-                except Exception as ex:
+                inserted = 0
+                for r in staged["records"]:
                     try:
-                        conn.rollback()
-                    except Exception:
+                        db[C_STUDENTS].insert_one({"_id": r["id"], "name": r["name"], "department": r["department"], "year": r["year"], "pin": r["pin"]})
+                        inserted += 1
+                    except DuplicateKeyError:
                         pass
-                    self._json(500, {"ok": False, "error": str(ex)})
-                    return
-                finally:
-                    conn.close()
+                audit(f"Imported {inserted} students")
             self._json(200, {"ok": True, "inserted": inserted})
             return
 
@@ -908,30 +720,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             eid = parts[3]
             with write_lock:
-                conn = get_conn()
-                try:
-                    row = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
-                    if not row:
-                        self._json(404, {"ok": False, "error": "Election not found"})
-                        return
-                    title = str(data.get("title", row["title"])).strip() or row["title"]
-                    validator = validate_election_payload(data)
-                    if validator:
-                        self._json(400, {"ok": False, "error": validator})
-                        return
-                    conn.execute("UPDATE elections SET type=?, title=? WHERE id=?", (data["type"], title, eid))
-                    replace_election_payload(conn, eid, data)
-                    audit(conn, f'Updated election "{title}"')
-                    conn.commit()
-                except Exception as ex:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    self._json(500, {"ok": False, "error": str(ex)})
+                row = db[C_ELECTIONS].find_one({"_id": eid})
+                if not row:
+                    self._json(404, {"ok": False, "error": "Election not found"})
                     return
-                finally:
-                    conn.close()
+                title = str(data.get("title", row["title"])).strip() or row["title"]
+                validator = validate_election_payload(data)
+                if validator:
+                    self._json(400, {"ok": False, "error": validator})
+                    return
+                db[C_ELECTIONS].update_one({"_id": eid}, {"$set": {"type": data["type"], "title": title}})
+                replace_election_payload(eid, data)
+                audit(f'Updated election "{title}"')
             self._json(200, {"ok": True})
             return
 
@@ -948,33 +748,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             eid = parts[3]
             with write_lock:
-                conn = get_conn()
-                try:
-                    row = conn.execute("SELECT * FROM elections WHERE id=?", (eid,)).fetchone()
-                    if not row:
-                        self._json(404, {"ok": False, "error": "Election not found"})
-                        return
-                    pids = [r["id"] for r in conn.execute("SELECT id FROM positions WHERE election_id=?", (eid,)).fetchall()]
-                    if pids:
-                        q = ",".join("?" * len(pids))
-                        conn.execute(f"DELETE FROM candidates WHERE position_id IN ({q})", pids)
-                        conn.execute(f"DELETE FROM ballots WHERE position_id IN ({q})", pids)
-                    conn.execute("DELETE FROM positions WHERE election_id=?", (eid,))
-                    conn.execute("DELETE FROM ballots WHERE election_id=?", (eid,))
-                    conn.execute("DELETE FROM voter_status WHERE election_id=?", (eid,))
-                    conn.execute("DELETE FROM election_departments WHERE election_id=?", (eid,))
-                    conn.execute("DELETE FROM elections WHERE id=?", (eid,))
-                    audit(conn, f'Deleted election "{row["title"]}"')
-                    conn.commit()
-                except Exception as ex:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    self._json(500, {"ok": False, "error": str(ex)})
+                row = db[C_ELECTIONS].find_one({"_id": eid})
+                if not row:
+                    self._json(404, {"ok": False, "error": "Election not found"})
                     return
-                finally:
-                    conn.close()
+                pids = [p["_id"] for p in db[C_POSITIONS].find({"election_id": eid})]
+                if pids:
+                    db[C_CANDIDATES].delete_many({"position_id": {"$in": pids}})
+                    db[C_BALLOTS].delete_many({"position_id": {"$in": pids}})
+                db[C_POSITIONS].delete_many({"election_id": eid})
+                db[C_BALLOTS].delete_many({"election_id": eid})
+                db[C_VOTER_STATUS].delete_many({"election_id": eid})
+                db[C_ELECTIONS].delete_one({"_id": eid})
+                audit(f'Deleted election "{row["title"]}"')
             self._json(200, {"ok": True})
             return
 
@@ -984,14 +770,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             sid = parts[3]
             with write_lock:
-                conn = get_conn()
-                try:
-                    conn.execute("DELETE FROM voter_status WHERE student_id=?", (sid,))
-                    conn.execute("DELETE FROM students WHERE id=?", (sid,))
-                    audit(conn, f'Removed student "{sid}"')
-                    conn.commit()
-                finally:
-                    conn.close()
+                db[C_VOTER_STATUS].delete_many({"student_id": sid})
+                db[C_STUDENTS].delete_one({"_id": sid})
+                audit(f'Removed student "{sid}"')
             self._json(200, {"ok": True})
             return
 
@@ -1000,12 +781,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"ok": False, "error": "Not authorized"})
                 return
             with write_lock:
-                conn = get_conn()
-                try:
-                    conn.execute("DELETE FROM audit_log")
-                    conn.commit()
-                finally:
-                    conn.close()
+                db[C_AUDIT].delete_many({})
             self._json(200, {"ok": True})
             return
 
@@ -1015,6 +791,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 if __name__ == "__main__":
     init_db()
     heal_demo_election()
@@ -1023,15 +801,15 @@ if __name__ == "__main__":
         allow_reuse_address = False
 
     try:
-        server = NoReuseServer(("127.0.0.1", PORT), Handler)
+        server = NoReuseServer((HOST, PORT), Handler)
     except OSError:
         print("  Port %d is already in use - the server appears to already be running." % PORT)
         print("  Just open http://localhost:%d in your browser." % PORT)
         raise SystemExit(0)
     print("=" * 56)
     print("  Student Association Election System")
-    print(f"  Database : {DB_PATH}")
-    print(f"  URL      : http://localhost:{PORT}")
+    print("  Database : MongoDB Atlas (%s)" % DB_NAME)
+    print("  URL      : http://localhost:%d" % PORT)
     print("  Admin    : admin / admin123")
     print("  Demo voters (ID / PIN):")
     print("    AIML_01 / 482913   | CSE_07 / 216907")
