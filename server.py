@@ -7,18 +7,18 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+'''BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "election.db")
-PORT = int(os.environ.get("PORT", "8000"))
-'''MONGODB_URI = os.environ.get(
+PORT = int(os.environ.get("PORT", "8000"))'''
+MONGODB_URI = os.environ.get(
     "MONGODB_URI",
-    "mongodb+srv://dadgesumit955_db_user:PPfsFKwfuh6DfWmw@cluster0.v6ifmlo.mongodb.net/"
+    "mongodb+srv://krishu2415:6cl0D3k1tG4YdP7y@cluster0.9woa6.mongodb.net/"
 )
 DB_NAME = "election_db"
 PORT = int(os.environ.get("PORT", "8000"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 if os.environ.get("RENDER"):
-    HOST = "0.0.0.0" '''
+    HOST = "0.0.0.0" 
 
 COLLEGE_NAME = "College of Engineering"
 DEPARTMENTS = ["AI & ML", "Computer Engineering", "Civil Engineering", "Electronics & Telecommunication"]
