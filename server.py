@@ -11,7 +11,7 @@ from pymongo.errors import DuplicateKeyError
 
 MONGODB_URI = os.environ.get(
     "MONGODB_URI",
-    "mongodb+srv://krishu2415:6cl0D3k1tG4YdP7y@cluster0.9woa6.mongodb.net/?retryWrites=true",
+    "mongodb+srv://dadgesumit955_db_user:TWB2XaB7sMhA8t0N@cluster0.m8rsdz4.mongodb.net/?retryWrites=true",
 )
 DB_NAME = "election_db"
 PORT = int(os.environ.get("PORT", "8000"))
