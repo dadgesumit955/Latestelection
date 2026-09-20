@@ -21,7 +21,7 @@ if os.environ.get("RENDER"):
 
 COLLEGE_NAME = "College of Engineering"
 DEPARTMENTS = ["AI & ML", "Computer Engineering", "Civil Engineering", "Electronics & Telecommunication"]
-ADMIN_USERS = {"admin": "admin123"}
+ADMIN_USERS = {"admin": "jspm123"}
 STATUSES = {"draft", "open", "paused", "closed", "published"}
 
 tokens = {}
