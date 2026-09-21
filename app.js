@@ -1,7 +1,7 @@
 const COLLEGE_NAME = "College of Engineering";
 const DEFAULT_DEPARTMENTS = ["AI & ML", "Computer Engineering", "Civil Engineering", "Electronics & Telecommunication"];
 
-const API_BASE = location.protocol === "file:" ? "http://localhost:8000" : "";
+const API_BASE = (location.protocol === "file:" || (location.port && Number(location.port) !== 8000)) ? "http://localhost:8000" : "";
 
 async function api(path, opts = {}) {
   const headers = {};
@@ -959,6 +959,33 @@ async function renderStudents() {
   }));
 }
 
+document.getElementById("add-student-btn").addEventListener("click", () => {
+  openModal(`
+    <h3>Add Student</h3>
+    <div class="form-group"><label>Student ID</label><input type="text" id="as-id" placeholder="e.g. AIML_42"></div>
+    <div class="form-group"><label>Full Name</label><input type="text" id="as-name" placeholder="Student name"></div>
+    <div class="form-group"><label>Department</label><select id="as-dept">${DEFAULT_DEPARTMENTS.map(d => `<option>${d}</option>`).join("")}</select></div>
+    <div class="form-group"><label>Year</label><input type="text" id="as-year" placeholder="SE"></div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" id="as-cancel">Cancel</button>
+      <button class="btn btn-primary btn-full" id="as-save">Add Student</button>
+    </div>`);
+  document.getElementById("as-cancel").addEventListener("click", closeModal);
+  document.getElementById("as-save").addEventListener("click", async () => {
+    const sid = document.getElementById("as-id").value.trim();
+    const name = document.getElementById("as-name").value.trim();
+    if (!sid || !name) { toast("Student ID and name required.", "error"); return; }
+    try {
+      const res = await api("/api/admin/students", { method: "POST", token: STATE.adminToken, body: { id: sid, name, department: document.getElementById("as-dept").value, year: document.getElementById("as-year").value.trim() || "SE" } });
+      closeModal();
+      await renderStudents();
+      toast(`Added ${res.student.name} (PIN ${res.student.pin}).`);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  });
+});
+
 document.getElementById("import-students-btn").addEventListener("click", () => document.getElementById("csv-input").click());
 
 document.getElementById("csv-input").addEventListener("change", function () {
@@ -1057,6 +1084,86 @@ function parseCSV(text) {
   if (row.some(c => c.trim() !== "")) rows.push(row);
   return rows;
 }
+
+document.getElementById("cand-csv-btn").addEventListener("click", () => document.getElementById("cand-csv-input").click());
+
+document.getElementById("cand-csv-input").addEventListener("change", function () {
+  const file = this.files[0];
+  if (!file) return;
+  const e = STATE.candidatesTarget;
+  if (!e) { toast("Select or create an election first.", "error"); this.value = ""; return; }
+  if (e.positions.length === 0) { toast("Add a position first.", "error"); this.value = ""; return; }
+  const reader = new FileReader();
+  reader.onload = async (ev) => {
+    try {
+      const parsed = parseCSV(ev.target.result);
+      if (parsed.length === 0) { toast("File is empty or unreadable.", "error"); return; }
+      const header = parsed[0].map(h => h.trim().toLowerCase());
+      const colName = header.indexOf("name");
+      const formatDetected = colName >= 0;
+      const colDept = header.indexOf("department");
+      const colYear = header.indexOf("year");
+      const colPlatform = header.indexOf("platform");
+      const colSymbol = header.indexOf("symbol");
+      const rows = parsed.slice(formatDetected ? 1 : 0).filter(r => r.some(c => c.trim() !== ""));
+      const idxName = formatDetected ? colName : 0;
+      const idxDept = formatDetected ? colDept : 1;
+      const idxYear = formatDetected && colYear >= 0 ? colYear : 2;
+      const idxPlatform = formatDetected && colPlatform >= 0 ? colPlatform : 3;
+      const idxSymbol = formatDetected && colSymbol >= 0 ? colSymbol : 4;
+      const clean = [];
+      const invalid = [];
+      for (const r of rows) {
+        const name = String(r[idxName] || "").trim();
+        if (!name) { invalid.push(r); continue; }
+        clean.push({
+          name,
+          department: String(r[idxDept] || "").trim(),
+          year: String(r[idxYear] || "").trim(),
+          platform: String(r[idxPlatform] || "").trim(),
+          symbol: String(r[idxSymbol] || "").trim(),
+        });
+      }
+      if (clean.length === 0) { toast("No valid candidate rows found.", "error"); return; }
+      const posHtml = e.positions.map((p, i) => `<option value="${i}">${escapeHtml(p.title)}</option>`).join("");
+      const hint = formatDetected ? "" : "No header row found — columns treated as Name, Department, Year, Platform, Symbol.";
+      openModal(`
+        <h3>Import Candidates from CSV</h3>
+        <div class="form-group"><label>Position (where to add them)</label><select id="cc-pos">${posHtml}</select></div>
+        <div class="card" style="padding:14px;background:var(--gray-50)">
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <span class="pill open">${clean.length} valid</span>
+            <span class="pill closed">${invalid.length} invalid</span>
+          </div>
+          ${hint ? `<p class="field-note">${hint}</p>` : ""}
+        </div>
+        <div class="card" style="overflow-x:auto;max-height:220px;overflow-y:auto">
+          <table class="data-table">
+            <tr><th>Name</th><th>Dept</th><th>Year</th><th>Platform</th></tr>
+            ${clean.slice(0, 20).map(c => `<tr><td>${escapeHtml(c.name)}</td><td>${escapeHtml(c.department)}</td><td>${escapeHtml(c.year)}</td><td>${escapeHtml(c.platform)}</td></tr>`).join("")}
+            ${clean.length > 20 ? `<tr><td colspan="4" class="muted small">…and ${clean.length - 20} more</td></tr>` : ""}
+          </table>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-outline" id="cc-cancel">Cancel</button>
+          <button class="btn btn-success btn-full" id="cc-save">Add ${clean.length} Candidates</button>
+        </div>`);
+      document.getElementById("cc-cancel").addEventListener("click", closeModal);
+      document.getElementById("cc-save").addEventListener("click", async () => {
+        const pi = parseInt(document.getElementById("cc-pos").value);
+        const added = clean.map(c => ({ id: makeLocalId("c_"), name: c.name, department: c.department, year: c.year, platform: c.platform, symbol: c.symbol, photo: null }));
+        STATE.candidatesTarget.positions[pi].candidates.push(...added);
+        closeModal();
+        await saveCandidatesTarget();
+        toast(`${added.length} candidates added.`);
+      });
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  };
+  reader.readAsText(file);
+  this.value = "";
+});
 
 /* ============ VOTING CONTROLS (admin) ============ */
 
