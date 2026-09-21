@@ -661,6 +661,27 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True})
             return
 
+        if parts[:3] == ["api", "admin", "students"] and len(parts) == 3:
+            if not authorize(self, "admin"):
+                self._json(401, {"ok": False, "error": "Not authorized"})
+                return
+            sid = str(data.get("id", "")).strip()
+            name = str(data.get("name", "")).strip()
+            dept = str(data.get("department", "")).strip()
+            year = str(data.get("year", "")).strip() or "SE"
+            if not sid or not name or not dept:
+                self._json(400, {"ok": False, "error": "Student ID, name and department are required"})
+                return
+            with write_lock:
+                if db[C_STUDENTS].find_one({"_id": sid}):
+                    self._json(409, {"ok": False, "error": f"Student {sid} already exists"})
+                    return
+                pin = make_pin()
+                db[C_STUDENTS].insert_one({"_id": sid, "name": name, "department": dept, "year": year, "pin": pin})
+                audit(f'Added student "{sid}"')
+            self._json(200, {"ok": True, "student": {"id": sid, "name": name, "department": dept, "year": year, "pin": pin}})
+            return
+
         if parts[:3] == ["api", "admin", "students"] and len(parts) == 4 and parts[3] == "import":
             if not authorize(self, "admin"):
                 self._json(401, {"ok": False, "error": "Not authorized"})
